@@ -1,0 +1,9 @@
+[package]
+name = "meinsum"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+lazy_static = {version = "*"}
+ndarray = {version = "*", features = ["approx"]}
+regex = {version = "*"}
