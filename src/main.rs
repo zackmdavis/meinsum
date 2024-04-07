@@ -101,6 +101,21 @@ fn parse_arrow_expression(expression: &str) -> Result<BinaryArrowOperation, Stri
     }
 }
 
+fn sourced_index_sizes(
+    sourced_indices: &[SourcedIndex],
+    inputs: Vec<&Array<f64, IxDyn>>,
+) -> Vec<usize> {
+    let mut sizes = Vec::new();
+    for sourced_index in sourced_indices {
+        for (source_no, source) in sourced_index.source_dimensions.iter().enumerate() {
+            for dimension in source {
+                sizes.push(inputs[source_no].shape()[*dimension])
+            }
+        }
+    }
+    sizes
+}
+
 fn einsum(
     expression: &str,
     a: &Array<f64, IxDyn>,
@@ -110,8 +125,8 @@ fn einsum(
     let operation = parse_arrow_expression(expression)?;
     let mut index_sizes = HashMap::<String, usize>::default();
     for (input_no, input_indices) in [
-        operation.first_input_indices,
-        operation.second_input_indices,
+        operation.first_input_indices.clone(),
+        operation.second_input_indices.clone(),
     ]
     .iter()
     .enumerate()
@@ -146,58 +161,113 @@ fn einsum(
     // use recursion to simulate nested for loops for the output indices
 
     fn summation_loops(
+        operation: &BinaryArrowOperation,
         first_input: &Array<f64, IxDyn>,
         second_input: &Array<f64, IxDyn>,
         summation_index_sizes: &[usize],
         current_depth: usize,
-        output_indices: &mut [usize],
-        summation_indices: &mut [usize],
+        output_index_values: &mut [usize],
+        summation_index_values: &mut [usize],
         total: &mut f64,
     ) {
         if current_depth == summation_index_sizes.len() {
-            // TODO: multiply and sum here
-            // *total += first_input[...] * second_input[...]
+            let mut input_index_values = vec![
+                vec![0; second_input.shape().len()],
+                vec![0; second_input.shape().len()],
+            ];
+            for output_index_value in &mut *output_index_values {
+                let source_dimensions =
+                    &operation.output_sourced_indices[*output_index_value].source_dimensions;
+                for (source_no, source) in source_dimensions.iter().enumerate() {
+                    for dimension_no in source {
+                        input_index_values[source_no][*dimension_no] = *output_index_value;
+                    }
+                }
+            }
+            for summation_index_value in &mut *summation_index_values {
+                let source_dimensions =
+                    &operation.output_sourced_indices[*summation_index_value].source_dimensions;
+                for (source_no, source) in source_dimensions.iter().enumerate() {
+                    for dimension_no in source {
+                        input_index_values[source_no][*dimension_no] = *summation_index_value;
+                    }
+                }
+            }
+
+            *total += first_input[input_index_values[0].as_slice()]
+                * second_input[input_index_values[1].as_slice()];
+            return;
         }
 
         for i in 0..summation_index_sizes[current_depth] {
-            summation_indices[current_depth] = i;
+            summation_index_values[current_depth] = i;
             summation_loops(
+                operation,
                 first_input,
                 second_input,
                 summation_index_sizes,
                 current_depth,
-                output_indices,
-                summation_indices,
+                output_index_values,
+                summation_index_values,
                 total,
             );
         }
     }
 
-    fn output_index_loops(
+    fn output_loops(
+        operation: &BinaryArrowOperation,
         first_input: &Array<f64, IxDyn>,
         second_input: &Array<f64, IxDyn>,
         output: &mut Array<f64, IxDyn>,
         output_index_sizes: &[usize],
         current_depth: usize,
-        output_indices: &mut [usize],
+        output_index_values: &mut [usize],
     ) {
         if current_depth == output_index_sizes.len() {
+            let summation_index_sizes = sourced_index_sizes(
+                &operation.summation_sourced_indices,
+                vec![first_input, second_input],
+            );
+            let mut summation_index_values = vec![0; operation.summation_sourced_indices.len()];
             let mut total = 0.;
-
-            output[&*output_indices] = total;
+            summation_loops(
+                operation,
+                first_input,
+                second_input,
+                &summation_index_sizes,
+                0, // launch at depth 0
+                output_index_values,
+                &mut summation_index_values,
+                &mut total,
+            );
+            output[&*output_index_values] = total;
+            return;
         }
         for i in 0..output_index_sizes[current_depth] {
-            output_indices[current_depth] = i;
-            output_index_loops(
+            output_index_values[current_depth] = i;
+            output_loops(
+                operation,
                 first_input,
                 second_input,
                 output,
                 output_index_sizes,
                 current_depth + 1,
-                output_indices,
+                output_index_values,
             )
         }
     }
+
+    let output_index_sizes = sourced_index_sizes(&operation.output_sourced_indices, vec![a, b]);
+    let mut output_index_values = vec![0; operation.output_sourced_indices.len()];
+    output_loops(
+        &operation,
+        a,
+        b,
+        &mut output,
+        &output_index_sizes,
+        0,
+        &mut output_index_values,
+    );
 
     Ok(output)
 }
