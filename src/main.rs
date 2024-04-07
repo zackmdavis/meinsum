@@ -1,12 +1,22 @@
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+
 use lazy_static::lazy_static;
 use ndarray::prelude::*;
 use regex::Regex;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourcedIndex {
+    name: String,
+    source_dimensions: Vec<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BinaryArrowOperation {
     first_input_indices: Vec<String>,
     second_input_indices: Vec<String>,
-    output_indices: Vec<String>,
-    summation_indices: Vec<String>,
+    output_sourced_indices: Vec<SourcedIndex>,
+    summation_sourced_indices: Vec<SourcedIndex>,
 }
 
 lazy_static! {
@@ -15,18 +25,79 @@ lazy_static! {
 }
 
 fn parse_indices(indices: &str) -> Vec<String> {
-    indices.split_whitespace().map(|i| i.to_owned()).collect::<Vec<_>>()
+    indices
+        .split_whitespace()
+        .map(|i| i.to_owned())
+        .collect::<Vec<_>>()
 }
 
-fn parse_arrow_expression(expression: &str) -> BinaryArrowOperation {
-    let captures = ARROW_EXPRESSION_REGEX.captures(expression);
-    // TODO: parse index labels out of the string
-    // Collect summation indices—those that don't appear in the output.
-    BinaryArrowOperation {
-        first_input_indices: vec![],
-        second_input_indices: vec![],
-        output_indices: vec![],
-        summation_indices: vec![],
+fn parse_arrow_expression(expression: &str) -> Result<BinaryArrowOperation, String> {
+    if let Some(captures) = ARROW_EXPRESSION_REGEX.captures(expression) {
+        let (_, [raw_first, raw_second, raw_output]) = captures.extract();
+        let first_input_indices = parse_indices(raw_first);
+        let second_input_indices = parse_indices(raw_second);
+        let output_indices = parse_indices(raw_output);
+
+        let mut full_indices_set = HashSet::new();
+        full_indices_set.extend(first_input_indices.clone());
+        full_indices_set.extend(second_input_indices.clone());
+        full_indices_set.extend(output_indices.clone());
+
+        let mut output_indices_set = HashSet::new();
+        output_indices_set.extend(output_indices.clone());
+
+        let summation_indices_set = full_indices_set.difference(&output_indices_set);
+        let mut summation_indices = summation_indices_set.into_iter().collect::<Vec<_>>();
+        summation_indices.sort_by(|a, b| a.cmp(&b));
+
+        let mut output_sourced_indices = vec![];
+        for output_index in output_indices {
+            let mut source_dimensions = vec![vec![], vec![]];
+            for (input_no, input_indices) in [&first_input_indices, &second_input_indices]
+                .iter()
+                .enumerate()
+            {
+                for (input_dimension, input_index) in input_indices.iter().enumerate() {
+                    if output_index == *input_index {
+                        source_dimensions[input_no].push(input_dimension);
+                    }
+                }
+            }
+            output_sourced_indices.push(SourcedIndex {
+                name: output_index,
+                source_dimensions,
+            });
+        }
+
+        let mut summation_sourced_indices = vec![];
+        for summation_index in summation_indices {
+            let mut source_dimensions = vec![vec![], vec![]];
+            for (input_no, input_indices) in [&first_input_indices, &second_input_indices]
+                .iter()
+                .enumerate()
+            {
+                for (input_dimension, input_index) in input_indices.iter().enumerate() {
+                    if summation_index == input_index {
+                        source_dimensions[input_no].push(input_dimension);
+                    }
+                }
+            }
+            summation_sourced_indices.push(SourcedIndex {
+                name: summation_index.to_string(),
+                source_dimensions,
+            });
+        }
+
+        let operation = BinaryArrowOperation {
+            first_input_indices,
+            second_input_indices,
+            output_sourced_indices,
+            summation_sourced_indices,
+        };
+
+        Ok(operation)
+    } else {
+        Err("didn't parse".to_owned())
     }
 }
 
@@ -34,14 +105,101 @@ fn einsum(
     expression: &str,
     a: &Array<f64, IxDyn>,
     b: &Array<f64, IxDyn>,
-) -> Result<Array<f64, IxDyn>, ()> {
-    let operation = parse_arrow_expression(expression);
-    // match up the index names and sizes
+) -> Result<Array<f64, IxDyn>, String> {
+    let inputs = [a, b];
+    let operation = parse_arrow_expression(expression)?;
+    let mut index_sizes = HashMap::<String, usize>::default();
+    for (input_no, input_indices) in [
+        operation.first_input_indices,
+        operation.second_input_indices,
+    ]
+    .iter()
+    .enumerate()
+    {
+        for (dimension_no, index_name) in input_indices.iter().enumerate() {
+            let incoming_size = inputs[input_no].shape()[dimension_no];
+            match index_sizes.entry(index_name.to_owned()) {
+                Entry::Occupied(entry) => {
+                    let incumbent_size = entry.get();
 
-    // create output array with output indices
+                    if *incumbent_size != incoming_size {
+                        return Err(format!(
+                            "index '{}' assigned inconsistent sizes: {} ≠ {}",
+                            index_name, incumbent_size, incoming_size
+                        ));
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(incoming_size);
+                }
+            }
+        }
+    }
+
+    let shape = operation
+        .output_sourced_indices
+        .iter()
+        .map(|si| index_sizes.get(&*si.name).expect("known index").to_owned())
+        .collect::<Vec<_>>();
+    let mut output: Array<f64, IxDyn> = Array::zeros(shape);
 
     // use recursion to simulate nested for loops for the output indices
-    Err(())
+
+    fn summation_loops(
+        first_input: &Array<f64, IxDyn>,
+        second_input: &Array<f64, IxDyn>,
+        summation_index_sizes: &[usize],
+        current_depth: usize,
+        output_indices: &mut [usize],
+        summation_indices: &mut [usize],
+        total: &mut f64,
+    ) {
+        if current_depth == summation_index_sizes.len() {
+            // TODO: multiply and sum here
+            // *total += first_input[...] * second_input[...]
+        }
+
+        for i in 0..summation_index_sizes[current_depth] {
+            summation_indices[current_depth] = i;
+            summation_loops(
+                first_input,
+                second_input,
+                summation_index_sizes,
+                current_depth,
+                output_indices,
+                summation_indices,
+                total,
+            );
+        }
+    }
+
+    fn output_index_loops(
+        first_input: &Array<f64, IxDyn>,
+        second_input: &Array<f64, IxDyn>,
+        output: &mut Array<f64, IxDyn>,
+        output_index_sizes: &[usize],
+        current_depth: usize,
+        output_indices: &mut [usize],
+    ) {
+        if current_depth == output_index_sizes.len() {
+            let mut total = 0.;
+
+            output[&*output_indices] = total;
+        }
+        for i in 0..output_index_sizes[current_depth] {
+            output_indices[current_depth] = i;
+            output_index_loops(
+                first_input,
+                second_input,
+                output,
+                output_index_sizes,
+                current_depth + 1,
+                output_indices,
+            )
+        }
+    }
+
+    Ok(output)
 }
 
 fn main() {
@@ -70,7 +228,11 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ARROW_EXPRESSION_REGEX, parse_indices};
+    use super::{
+        einsum, parse_arrow_expression, parse_indices, BinaryArrowOperation, SourcedIndex,
+        ARROW_EXPRESSION_REGEX,
+    };
+    use ndarray::Array;
 
     #[test]
     fn test_arrow_expression_regex_matches() {
@@ -98,7 +260,62 @@ mod tests {
 
     #[test]
     fn test_parse_indices() {
-        assert_eq!(parse_indices("i j k"), vec!["i".to_owned(), "j".to_owned(), "k".to_owned()]);
-        assert_eq!(parse_indices("i j k "), vec!["i".to_owned(), "j".to_owned(), "k".to_owned()])
+        assert_eq!(
+            parse_indices("i j k"),
+            vec!["i".to_owned(), "j".to_owned(), "k".to_owned()]
+        );
+        assert_eq!(
+            parse_indices("i j k "),
+            vec!["i".to_owned(), "j".to_owned(), "k".to_owned()]
+        )
+    }
+
+    #[test]
+    fn test_parse_arrow_expression() {
+        let operation = parse_arrow_expression("i j k, l m n -> i m n").expect("parses");
+        let expected = BinaryArrowOperation {
+            first_input_indices: vec!["i", "j", "k"].iter().map(|&s| s.to_owned()).collect(),
+            second_input_indices: vec!["l", "m", "n"].iter().map(|&s| s.to_owned()).collect(),
+            output_sourced_indices: vec![
+                SourcedIndex {
+                    name: "i".to_owned(),
+                    source_dimensions: vec![vec![0], vec![]],
+                },
+                SourcedIndex {
+                    name: "m".to_owned(),
+                    source_dimensions: vec![vec![], vec![1]],
+                },
+                SourcedIndex {
+                    name: "n".to_owned(),
+                    source_dimensions: vec![vec![], vec![2]],
+                },
+            ],
+            summation_sourced_indices: vec![
+                SourcedIndex {
+                    name: "j".to_owned(),
+                    source_dimensions: vec![vec![1], vec![]],
+                },
+                SourcedIndex {
+                    name: "k".to_owned(),
+                    source_dimensions: vec![vec![2], vec![]],
+                },
+                SourcedIndex {
+                    name: "l".to_owned(),
+                    source_dimensions: vec![vec![], vec![0]],
+                },
+            ],
+        };
+        assert_eq!(expected, operation);
+    }
+
+    #[test]
+    fn test_einsum_inconsistent_index_size_error() {
+        let a = Array::zeros((2, 3)).into_dyn();
+        let b = Array::zeros((4, 5)).into_dyn();
+        let result = einsum("i j, j k -> i k", &a, &b);
+        assert_eq!(
+            Err("index 'j' assigned inconsistent sizes: 3 ≠ 4".to_owned()),
+            result
+        );
     }
 }
