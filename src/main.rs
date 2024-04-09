@@ -101,21 +101,6 @@ fn parse_arrow_expression(expression: &str) -> Result<BinaryArrowOperation, Stri
     }
 }
 
-fn sourced_index_sizes(
-    sourced_indices: &[SourcedIndex],
-    inputs: Vec<&Array<f64, IxDyn>>,
-) -> Vec<usize> {
-    let mut sizes = Vec::new();
-    for sourced_index in sourced_indices {
-        for (source_no, source) in sourced_index.source_dimensions.iter().enumerate() {
-            for dimension in source {
-                sizes.push(inputs[source_no].shape()[*dimension])
-            }
-        }
-    }
-    sizes
-}
-
 fn einsum(
     expression: &str,
     a: &Array<f64, IxDyn>,
@@ -124,6 +109,7 @@ fn einsum(
     let inputs = [a, b];
     let operation = parse_arrow_expression(expression)?;
     let mut index_sizes = HashMap::<String, usize>::default();
+    let mut index_locations = HashMap::<String, Vec<(usize, usize)>>::default();
     for (input_no, input_indices) in [
         operation.first_input_indices.clone(),
         operation.second_input_indices.clone(),
@@ -131,6 +117,10 @@ fn einsum(
     .iter()
     .enumerate()
     {
+        // We information about what size and input dimension the index labels
+        // correspond to, because when we loop over the summation and output
+        // indices later, we need to know what corresponding entries of the
+        // original inputs to process
         for (dimension_no, index_name) in input_indices.iter().enumerate() {
             let incoming_size = inputs[input_no].shape()[dimension_no];
             match index_sizes.entry(index_name.to_owned()) {
@@ -148,6 +138,16 @@ fn einsum(
                     entry.insert(incoming_size);
                 }
             }
+
+            match index_locations.entry(index_name.to_owned()) {
+                Entry::Occupied(mut entry) => {
+                    let incumbent_locations = entry.get_mut();
+                    incumbent_locations.push((input_no, dimension_no));
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(vec![(input_no, dimension_no)]);
+                }
+            }
         }
     }
 
@@ -162,6 +162,7 @@ fn einsum(
 
     fn summation_loops(
         operation: &BinaryArrowOperation,
+        index_locations: &HashMap<String, Vec<(usize, usize)>>,
         first_input: &Array<f64, IxDyn>,
         second_input: &Array<f64, IxDyn>,
         summation_index_sizes: &[usize],
@@ -171,26 +172,46 @@ fn einsum(
         total: &mut f64,
     ) {
         if current_depth == summation_index_sizes.len() {
+            // `input_index_values` is going to be the indexes that we use in
+            // the "+= A[i, j] * B[j, k]" step (imagining matrix multiplication
+            // as our prototypical example case). We initialize these to a
+            // dummy value, then fill in the output indices (i, k in the
+            // prototype example) and the summation indices (j).
+            //
+            // But given that we know the values of (e.g.) i, j, and k in the implied
+            // nested loops, we still need to match those up with the
+            // appropriate dimensions of A and B.
+
             let mut input_index_values = vec![
-                vec![0; second_input.shape().len()],
+                vec![0; first_input.shape().len()],
                 vec![0; second_input.shape().len()],
             ];
-            for output_index_value in &mut *output_index_values {
-                let source_dimensions =
-                    &operation.output_sourced_indices[*output_index_value].source_dimensions;
-                for (source_no, source) in source_dimensions.iter().enumerate() {
-                    for dimension_no in source {
-                        input_index_values[source_no][*dimension_no] = *output_index_value;
-                    }
+
+            // We have the output and summation indices, in the order they were
+            // stored on the BinaryArrow operation.
+            //
+            // And we need to map them onto the corresponding input dimensions.
+
+            for (index_value, sourced_index) in summation_index_values
+                .iter()
+                .zip(&operation.summation_sourced_indices)
+            {
+                for address in index_locations
+                    .get(&sourced_index.name)
+                    .expect("previously recorded")
+                {
+                    input_index_values[address.0][address.1] = *index_value;
                 }
             }
-            for summation_index_value in &mut *summation_index_values {
-                let source_dimensions =
-                    &operation.output_sourced_indices[*summation_index_value].source_dimensions;
-                for (source_no, source) in source_dimensions.iter().enumerate() {
-                    for dimension_no in source {
-                        input_index_values[source_no][*dimension_no] = *summation_index_value;
-                    }
+            for (index_value, sourced_index) in output_index_values
+                .iter()
+                .zip(&operation.output_sourced_indices)
+            {
+                for address in index_locations
+                    .get(&sourced_index.name)
+                    .expect("previously recorded")
+                {
+                    input_index_values[address.0][address.1] = *index_value;
                 }
             }
 
@@ -203,10 +224,11 @@ fn einsum(
             summation_index_values[current_depth] = i;
             summation_loops(
                 operation,
+                index_locations,
                 first_input,
                 second_input,
                 summation_index_sizes,
-                current_depth,
+                current_depth + 1,
                 output_index_values,
                 summation_index_values,
                 total,
@@ -216,6 +238,8 @@ fn einsum(
 
     fn output_loops(
         operation: &BinaryArrowOperation,
+        index_sizes: &HashMap<String, usize>,
+        index_locations: &HashMap<String, Vec<(usize, usize)>>,
         first_input: &Array<f64, IxDyn>,
         second_input: &Array<f64, IxDyn>,
         output: &mut Array<f64, IxDyn>,
@@ -224,14 +248,16 @@ fn einsum(
         output_index_values: &mut [usize],
     ) {
         if current_depth == output_index_sizes.len() {
-            let summation_index_sizes = sourced_index_sizes(
-                &operation.summation_sourced_indices,
-                vec![first_input, second_input],
-            );
+            let summation_index_sizes = operation
+                .summation_sourced_indices
+                .iter()
+                .map(|si| *index_sizes.get(&si.name).expect("size previously recorded"))
+                .collect::<Vec<_>>();
             let mut summation_index_values = vec![0; operation.summation_sourced_indices.len()];
             let mut total = 0.;
             summation_loops(
                 operation,
+                index_locations,
                 first_input,
                 second_input,
                 &summation_index_sizes,
@@ -247,6 +273,8 @@ fn einsum(
             output_index_values[current_depth] = i;
             output_loops(
                 operation,
+                index_sizes,
+                index_locations,
                 first_input,
                 second_input,
                 output,
@@ -257,10 +285,16 @@ fn einsum(
         }
     }
 
-    let output_index_sizes = sourced_index_sizes(&operation.output_sourced_indices, vec![a, b]);
+    let output_index_sizes = operation
+        .output_sourced_indices
+        .iter()
+        .map(|si| *index_sizes.get(&si.name).expect("size previously recorded"))
+        .collect::<Vec<_>>();
     let mut output_index_values = vec![0; operation.output_sourced_indices.len()];
     output_loops(
         &operation,
+        &index_sizes,
+        &index_locations,
         a,
         b,
         &mut output,
