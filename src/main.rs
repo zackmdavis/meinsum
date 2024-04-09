@@ -336,7 +336,7 @@ mod tests {
         einsum, parse_arrow_expression, parse_indices, BinaryArrowOperation, SourcedIndex,
         ARROW_EXPRESSION_REGEX,
     };
-    use ndarray::Array;
+    use ndarray::{arr1, arr2, Array};
 
     #[test]
     fn test_arrow_expression_regex_matches() {
@@ -421,5 +421,15 @@ mod tests {
             Err("index 'j' assigned inconsistent sizes: 3 ≠ 4".to_owned()),
             result
         );
+    }
+
+    #[test]
+    fn test_einsum_outer_prodcut() {
+        let a = arr1(&[1., 2., 3.]).into_dyn();
+        let b = arr1(&[4., 5.]).into_dyn();
+
+        let expected = arr2(&[[4., 5.], [8., 10.], [12., 15.]]).into_dyn();
+        let result = einsum("a, b → a b", &a, &b).expect("einsummed");
+        assert_eq!(expected, result);
     }
 }
