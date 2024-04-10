@@ -336,7 +336,7 @@ mod tests {
         einsum, parse_arrow_expression, parse_indices, BinaryArrowOperation, SourcedIndex,
         ARROW_EXPRESSION_REGEX,
     };
-    use ndarray::{arr1, arr2, Array};
+    use ndarray::{arr0, arr1, arr2, Array};
 
     #[test]
     fn test_arrow_expression_regex_matches() {
@@ -432,4 +432,34 @@ mod tests {
         let result = einsum("a, b → a b", &a, &b).expect("einsummed");
         assert_eq!(expected, result);
     }
+
+    // TODO? Empty right-hand side works in einops.einsum ...
+    //
+    // In [3]: u = torch.tensor([1, 2, 3])
+    //
+    // In [4]: v = torch.tensor([4, 5, 6])
+    //
+    // In [5]: einops.einsum(u, v, "a, a ->")
+    // Out[5]: tensor(32)
+    //
+    // In [6]: einops.einsum(u, v, "a, a ->").shape
+    // Out[6]: torch.Size([])
+    #[test]
+    #[ignore]
+    fn test_inner_product() {
+        let u = arr1(&[1., 2., 3.]).into_dyn();
+        let v = arr1(&[4., 5., 6.]).into_dyn();
+
+        let expected = arr0(32.).into_dyn();
+        let result = einsum("a, a →", &u, &v).expect("einsummed");
+        assert_eq!(expected, result);
+    }
+
 }
+
+// TODO—
+// • Empty right-hand side
+// • More examples (cover list at the bottom of
+// https://obilaniu6266h16.wordpress.com/2016/02/04/einstein-summation-in-numpy/)
+// • Generalize to arbitrary number of inputs
+// • macro_rules! so that the arbitrary inputs can be supplied as varargs
